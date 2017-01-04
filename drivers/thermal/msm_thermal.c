@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -139,8 +139,8 @@ static int sensor_cnt;
 static int psm_rails_cnt;
 static int ocr_rail_cnt;
 static int limit_idx;
-static int limit_idx_low;
-static int limit_idx_high;
+static int limit_idx_low = 8;
+static int limit_idx_high = 20;
 static int max_tsens_num;
 static struct cpufreq_frequency_table *table;
 static uint32_t usefreq;
@@ -159,7 +159,6 @@ static bool ocr_nodes_called;
 static bool ocr_probed;
 static bool ocr_reg_init_defer;
 static bool hotplug_enabled;
-static bool interrupt_mode_enable;
 static bool msm_thermal_probed;
 static bool gfx_crit_phase_ctrl_enabled;
 static bool gfx_warm_phase_ctrl_enabled;
@@ -952,6 +951,52 @@ void devmgr_unregister_mitigation_client(struct device *dev,
 	if (dev_mgr->update)
 		dev_mgr->update(dev_mgr);
 }
+
+#define PSM_REG_MODE_FROM_ATTRIBS(attr) \
+	(container_of(attr, struct psm_rail, mode_attr));
+
+#define DEFAULT_POLLING_MS	250
+/* last 3 minutes based on 250ms polling cycle */
+#define MAX_HISTORY_SZ		((3*60*1000) / DEFAULT_POLLING_MS)
+
+struct msm_thermal_stat_data {
+	int32_t temp_history[MAX_HISTORY_SZ];
+	uint32_t throttled;
+	uint32_t warning;
+	uint32_t normal;
+};
+static struct msm_thermal_stat_data msm_thermal_stats;
+
+/* module parameters */
+module_param_named(poll_ms, msm_thermal_info.poll_ms, uint, 0664);
+module_param_named(limit_temp_degC, msm_thermal_info.limit_temp_degC,
+			int, 0664);
+module_param_named(freq_control_mask, msm_thermal_info.bootup_freq_control_mask,
+			uint, 0664);
+module_param_named(core_limit_temp_degC, msm_thermal_info.core_limit_temp_degC,
+			int, 0664);
+module_param_named(core_control_mask, msm_thermal_info.core_control_mask,
+			uint, 0664);
+
+/* extended module parameters */
+module_param_named(temp_hysteresis_degC, msm_thermal_info.temp_hysteresis_degC,
+                        int, 0664);
+module_param_named(freq_step, msm_thermal_info.bootup_freq_step,
+			uint, 0644);
+module_param_named(core_temp_hysteresis_degC, msm_thermal_info.core_temp_hysteresis_degC,
+                        int, 0664);
+module_param_named(hotplug_temp, msm_thermal_info.hotplug_temp_degC,
+			uint, 0644);
+module_param_named(thermal_limit_high, limit_idx_high,
+			int, 0664);
+module_param_named(thermal_limit_low, limit_idx_low,
+			int, 0664);
+module_param_named(hotplug_temp_hysteresis, msm_thermal_info.hotplug_temp_hysteresis_degC,
+			uint, 0644);
+module_param_named(psm_temp, msm_thermal_info.psm_temp_degC,
+			uint, 0644);
+module_param_named(psm_temp_hysteresis, msm_thermal_info.psm_temp_hyst_degC,
+			uint, 0644);
 
 static int  msm_thermal_cpufreq_callback(struct notifier_block *nfb,
 		unsigned long event, void *data)
@@ -1806,14 +1851,14 @@ static int vdd_restriction_apply_voltage(struct rail *r, int level)
 	/* level = -1: disable, level = 0,1,2..n: enable */
 	if (level == -1) {
 		ret = regulator_set_voltage(r->reg, r->min_level,
-			r->levels[r->num_levels - 1]);
+			INT_MAX);
 		if (!ret)
 			r->curr_level = -1;
 		pr_debug("Requested min level for %s. curr level: %d\n",
 				r->name, r->curr_level);
 	} else if (level >= 0 && level < (r->num_levels)) {
 		ret = regulator_set_voltage(r->reg, r->levels[level],
-			r->levels[r->num_levels - 1]);
+			INT_MAX);
 		if (!ret)
 			r->curr_level = level;
 		pr_debug("Requesting level %d for %s. curr level: %d\n",
@@ -2695,8 +2740,12 @@ static void vdd_mx_notify(struct therm_threshold *trig_thresh)
 			pr_err("Failed to remove vdd mx restriction\n");
 	}
 	mutex_unlock(&vdd_mx_mutex);
-	sensor_mgr_set_threshold(trig_thresh->sensor_id,
+
+	if (trig_thresh->cur_state != trig_thresh->trip_triggered) {
+		sensor_mgr_set_threshold(trig_thresh->sensor_id,
 					trig_thresh->threshold);
+		trig_thresh->cur_state = trig_thresh->trip_triggered;
+	}
 }
 
 static void msm_thermal_bite(int zone_id, long temp)
@@ -2819,7 +2868,7 @@ static void __ref do_core_control(long temp)
 				cpu_dev = get_cpu_device(i);
 				trace_thermal_pre_core_offline(i);
 				ret = device_offline(cpu_dev);
-				if (ret)
+				if (ret < 0)
 					pr_err("Error %d offline core %d\n",
 					       ret, i);
 				trace_thermal_post_core_offline(i,
@@ -2892,7 +2941,8 @@ static int __ref update_offline_cores(int val)
 			cpu_dev = get_cpu_device(cpu);
 			trace_thermal_pre_core_offline(cpu);
 			ret = device_offline(cpu_dev);
-			if (ret) {
+			if (ret < 0) {
+				cpus_offlined &= ~BIT(cpu);
 				pr_err_ratelimited(
 					"Unable to offline CPU%d. err:%d\n",
 					cpu, ret);
@@ -2962,6 +3012,14 @@ static __ref int do_hotplug(void *data)
 			&hotplug_notify_complete) != 0)
 			;
 		reinit_completion(&hotplug_notify_complete);
+
+		/*
+		 * Suspend framework will have disabled the
+		 * hotplug functionality. So wait till the suspend exits
+		 * and then re-evaluate.
+		 */
+		if (in_suspend)
+			continue;
 		mask = 0;
 
 		mutex_lock(&core_control_mutex);
@@ -3395,6 +3453,8 @@ static void check_temp(struct work_struct *work)
 	int ret = 0;
 
 	do_therm_reset();
+	if (!msm_thermal_probed)
+ 		return;
 
 	ret = therm_get_temp(msm_thermal_info.sensor_id, THERM_TSENS_ID, &temp);
 	if (ret) {
@@ -3512,7 +3572,7 @@ static int hotplug_init_cpu_offlined(void)
 	long temp = 0;
 	uint32_t cpu = 0;
 
-	if (!hotplug_enabled)
+	if (!hotplug_enabled || !hotplug_task)
 		return 0;
 
 	mutex_lock(&core_control_mutex);
@@ -3529,8 +3589,7 @@ static int hotplug_init_cpu_offlined(void)
 
 		if (temp >= msm_thermal_info.hotplug_temp_degC)
 			cpus[cpu].offline = 1;
-		else if (temp <= (msm_thermal_info.hotplug_temp_degC -
-			msm_thermal_info.hotplug_temp_hysteresis_degC))
+		else
 			cpus[cpu].offline = 0;
 	}
 	mutex_unlock(&core_control_mutex);
@@ -3767,6 +3826,8 @@ init_freq_thread:
 		pr_err("Failed to create frequency mitigation thread. err:%ld\n",
 				PTR_ERR(freq_mitigation_task));
 		return;
+	} else {
+		complete(&freq_mitigation_complete);
 	}
 }
 
@@ -4065,8 +4126,11 @@ static void cx_phase_ctrl_notify(struct therm_threshold *trig_thresh)
 cx_phase_unlock_exit:
 	mutex_unlock(&cx_mutex);
 cx_phase_ctrl_exit:
-	sensor_mgr_set_threshold(trig_thresh->sensor_id,
+	if (trig_thresh->cur_state != trig_thresh->trip_triggered) {
+		sensor_mgr_set_threshold(trig_thresh->sensor_id,
 					trig_thresh->threshold);
+		trig_thresh->cur_state = trig_thresh->trip_triggered;
+	}
 	return;
 }
 
@@ -4194,8 +4258,11 @@ static void vdd_restriction_notify(struct therm_threshold *trig_thresh)
 unlock_and_exit:
 	mutex_unlock(&vdd_rstr_mutex);
 set_and_exit:
-	sensor_mgr_set_threshold(trig_thresh->sensor_id,
+	if (trig_thresh->cur_state != trig_thresh->trip_triggered) {
+		sensor_mgr_set_threshold(trig_thresh->sensor_id,
 					trig_thresh->threshold);
+		trig_thresh->cur_state = trig_thresh->trip_triggered;
+	}
 	return;
 }
 
@@ -4243,8 +4310,11 @@ static void ocr_notify(struct therm_threshold *trig_thresh)
 unlock_and_exit:
 	mutex_unlock(&ocr_mutex);
 set_and_exit:
-	sensor_mgr_set_threshold(trig_thresh->sensor_id,
-					trig_thresh->threshold);
+	if (trig_thresh->cur_state != trig_thresh->trip_triggered) {
+		sensor_mgr_set_threshold(trig_thresh->sensor_id,
+				trig_thresh->threshold);
+		trig_thresh->cur_state = trig_thresh->trip_triggered;
+	}
 	return;
 }
 
@@ -4479,6 +4549,7 @@ int sensor_mgr_init_threshold(struct threshold_info *thresh_inp,
 			thresh_ptr[i].notify = callback;
 			thresh_ptr[i].trip_triggered = -1;
 			thresh_ptr[i].parent = thresh_inp;
+			thresh_ptr[i].cur_state = -1;
 			thresh_ptr[i].threshold[0].temp =
 				high_temp * tsens_scaling_factor;
 			thresh_ptr[i].threshold[0].trip =
@@ -4499,6 +4570,7 @@ int sensor_mgr_init_threshold(struct threshold_info *thresh_inp,
 		thresh_ptr->notify = callback;
 		thresh_ptr->trip_triggered = -1;
 		thresh_ptr->parent = thresh_inp;
+		thresh_ptr->cur_state = -1;
 		thresh_ptr->threshold[0].temp = high_temp * tsens_scaling_factor;
 		thresh_ptr->threshold[0].trip =
 			THERMAL_TRIP_CONFIGURABLE_HI;
@@ -4675,10 +4747,9 @@ static void __ref disable_msm_thermal(void)
 
 static void interrupt_mode_init(void)
 {
-	if (!msm_thermal_probed) {
-		interrupt_mode_enable = true;
+	if (!msm_thermal_probed)
 		return;
-	}
+
 	if (polling_enabled) {
 		polling_enabled = 0;
 		create_sensor_zone_id_map();
@@ -4695,17 +4766,25 @@ static int __ref set_enabled(const char *val, const struct kernel_param *kp)
 {
 	int ret = 0;
 
-	ret = param_set_bool(val, kp);
-	if (!enabled)
+	if (*val == '0' || *val == 'n' || *val == 'N') {
+		enabled = 0;
 		interrupt_mode_init();
-	else
-		pr_info("no action for enabled = %d\n",
-			enabled);
+		pr_info("%s: msm_thermal disabled!\n", KBUILD_MODNAME);
+	} else {
+		if (!enabled) {
+			enabled = 1;
+			schedule_delayed_work(&check_temp_work,
+				msecs_to_jiffies(msm_thermal_info.poll_ms));
+			pr_info("%s: rescheduling...\n", KBUILD_MODNAME);
+		} else
+			pr_info("%s: already running...\n", KBUILD_MODNAME);
+	}
 
 	pr_info("enabled = %d\n", enabled);
 
 	return ret;
 }
+
 
 static struct kernel_param_ops module_ops = {
 	.set = set_enabled,
@@ -4865,6 +4944,83 @@ static __init int msm_thermal_add_cc_nodes(void)
 done_cc_nodes:
 	if (cc_kobj)
 		kobject_del(cc_kobj);
+	return ret;
+}
+
+static ssize_t show_thermal_stats(struct kobject *kobj,
+                struct kobj_attribute *attr, char *buf)
+{
+
+	int i = 0;
+	int tmp = 0;
+
+	/* clear out old stats */
+	msm_thermal_stats.throttled = 0;
+	msm_thermal_stats.warning = 0;
+	msm_thermal_stats.normal = 0;
+
+	for (i = 0; i < MAX_HISTORY_SZ; i++) {
+		tmp = msm_thermal_stats.temp_history[i];
+		if (tmp >= msm_thermal_info.limit_temp_degC)
+			msm_thermal_stats.throttled++;
+		else if (tmp < msm_thermal_info.limit_temp_degC &&
+			 tmp >= (msm_thermal_info.limit_temp_degC -
+				 msm_thermal_info.temp_hysteresis_degC))
+			msm_thermal_stats.warning++;
+		else
+			msm_thermal_stats.normal++;
+	}
+        return snprintf(buf, PAGE_SIZE, "%u %u %u\n",
+			msm_thermal_stats.throttled,
+			msm_thermal_stats.warning,
+			msm_thermal_stats.normal);
+}
+
+static __refdata struct kobj_attribute msm_thermal_stat_attr =
+__ATTR(statistics, 0444, show_thermal_stats, NULL);
+
+static __refdata struct attribute *msm_thermal_stat_attrs[] = {
+        &msm_thermal_stat_attr.attr,
+        NULL,
+};
+
+static __refdata struct attribute_group msm_thermal_stat_attr_group = {
+        .attrs = msm_thermal_stat_attrs,
+};
+
+static __init int msm_thermal_add_stat_nodes(void)
+{
+	struct kobject *module_kobj = NULL;
+	struct kobject *stat_kobj = NULL;
+	int ret = 0;
+
+	module_kobj = kset_find_obj(module_kset, KBUILD_MODNAME);
+	if (!module_kobj) {
+		pr_err("%s: cannot find kobject for module\n",
+			KBUILD_MODNAME);
+		ret = -ENOENT;
+		goto done_stat_nodes;
+	}
+
+	stat_kobj = kobject_create_and_add("thermal_stats", module_kobj);
+	if (!stat_kobj) {
+		pr_err("%s: cannot create core control kobj\n",
+				KBUILD_MODNAME);
+		ret = -ENOMEM;
+		goto done_stat_nodes;
+	}
+
+    ret = sysfs_create_group(stat_kobj, &msm_thermal_stat_attr_group);
+	if (ret) {
+		pr_err("%s: cannot create group\n", KBUILD_MODNAME);
+		goto done_stat_nodes;
+	}
+
+	return 0;
+
+done_stat_nodes:
+	if (stat_kobj)
+		kobject_del(stat_kobj);
 	return ret;
 }
 
@@ -5131,6 +5287,7 @@ int msm_thermal_init(struct msm_thermal_data *pdata)
 	}
 
 	enabled = 1;
+	pr_info("%s: polling enabled!\n", KBUILD_MODNAME);
 	polling_enabled = 1;
 	ret = cpufreq_register_notifier(&msm_thermal_cpufreq_notifier,
 			CPUFREQ_POLICY_NOTIFIER);
@@ -5141,7 +5298,7 @@ int msm_thermal_init(struct msm_thermal_data *pdata)
 	pm_notifier(msm_thermal_suspend_callback, 0);
 	INIT_DELAYED_WORK(&retry_hotplug_work, retry_hotplug);
 	INIT_DELAYED_WORK(&check_temp_work, check_temp);
-	schedule_delayed_work(&check_temp_work, 0);
+	schedule_delayed_work(&check_temp_work, msecs_to_jiffies(10000));
 
 	if (num_possible_cpus() > 1) {
 		cpus_previously_online_update();
@@ -5778,6 +5935,13 @@ static int probe_vdd_mx(struct device_node *node,
 	if (ret)
 		goto read_node_done;
 
+	/*
+	 * Monitor only this sensor if defined, otherwise monitor all tsens
+	 */
+	key = "qcom,mx-restriction-sensor_id";
+	if (of_property_read_u32(node, key, &data->vdd_mx_sensor_id))
+		data->vdd_mx_sensor_id = MONITOR_ALL_TSENS;
+
 	vdd_mx = devm_regulator_get(&pdev->dev, "vdd-mx");
 	if (IS_ERR_OR_NULL(vdd_mx)) {
 		ret = PTR_ERR(vdd_mx);
@@ -5804,7 +5968,7 @@ static int probe_vdd_mx(struct device_node *node,
 	}
 
 	ret = sensor_mgr_init_threshold(&thresh[MSM_VDD_MX_RESTRICTION],
-			MONITOR_ALL_TSENS,
+			data->vdd_mx_sensor_id,
 			data->vdd_mx_temp_degC + data->vdd_mx_temp_hyst_degC,
 			data->vdd_mx_temp_degC, vdd_mx_notify);
 
@@ -6743,6 +6907,9 @@ static void thermal_mx_config_read(struct seq_file *m, void *data)
 		if (vdd_cx)
 			seq_printf(m, "cx retention value:%d\n",
 				msm_thermal_info.vdd_cx_min);
+		if (msm_thermal_info.vdd_mx_sensor_id != MONITOR_ALL_TSENS)
+			seq_printf(m, "tsens sensor:tsens_tz_sensor%d\n",
+				msm_thermal_info.vdd_mx_sensor_id);
 	}
 }
 
@@ -6980,7 +7147,7 @@ static int msm_thermal_dev_probe(struct platform_device *pdev)
 	char *key = NULL;
 	struct device_node *node = pdev->dev.of_node;
 	struct msm_thermal_data data;
-
+        pr_info("%s: msm_thermal_dev_probe begin...\n", KBUILD_MODNAME);
 	if (!mitigation)
 		return ret;
 
@@ -7087,17 +7254,13 @@ static int msm_thermal_dev_probe(struct platform_device *pdev)
 	msm_thermal_ioctl_init();
 	ret = msm_thermal_init(&data);
 	msm_thermal_probed = true;
-
-	if (interrupt_mode_enable) {
-		interrupt_mode_init();
-		interrupt_mode_enable = false;
-	}
-
+	pr_info("%s: msm_thermal_dev_probe completed!\n", KBUILD_MODNAME);
 	return ret;
 fail:
 	if (ret)
 		pr_err("Failed reading node=%s, key=%s. err:%d\n",
 			node->full_name, key, ret);
+		pr_info("%s: msm_thermal_dev_probe failed!\n", KBUILD_MODNAME);
 probe_exit:
 	return ret;
 }
@@ -7115,6 +7278,7 @@ static int msm_thermal_dev_exit(struct platform_device *inp_dev)
 	if (msm_therm_debugfs && msm_therm_debugfs->parent)
 		debugfs_remove_recursive(msm_therm_debugfs->parent);
 	msm_thermal_ioctl_cleanup();
+	pr_info("msm_thermal_dev: removed!\n");
 	if (thresh) {
 		if (vdd_rstr_enabled) {
 			sensor_mgr_remove_threshold(
@@ -7228,12 +7392,16 @@ int __init msm_thermal_late_init(void)
 		}
 	}
 	msm_thermal_add_mx_nodes();
-	interrupt_mode_init();
 	create_cpu_topology_sysfs();
 	create_thermal_debugfs();
 	msm_thermal_add_bucket_info_nodes();
 	uio_init(msm_thermal_info.pdev);
-
+	msm_thermal_add_stat_nodes();
 	return 0;
 }
 late_initcall(msm_thermal_late_init);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Praveen Chidambaram <pchidamb@codeaurora.org>");
+MODULE_AUTHOR("Paul Reioux <reioux@gmail.com>");
+MODULE_DESCRIPTION("Based on intelligent thermal driver version 2 for Qualcomm based SOCs");
+MODULE_DESCRIPTION("originally from Qualcomm's open source repo");
