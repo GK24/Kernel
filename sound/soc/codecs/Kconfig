@@ -863,6 +863,9 @@ config SND_SOC_MSM_HDMI_DBA_CODEC_RX
 	bool "HDMI DBA Audio Playback"
 	depends on MSM_DBA
 
+config SOUND_CONTROL
+	bool "Sound control for wcd9335"
+
 config NXP_TFA98xx
         depends on I2C
         tristate "NXP TFA98xx Support"
