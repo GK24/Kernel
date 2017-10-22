@@ -75,5 +75,6 @@ obj-y += le_rkm.o
 #sensors add for MAX86100
 obj-$(CONFIG_SENSORS_SYSFS)	+= sensors_core.o
 obj-$(CONFIG_SENSORS_MAX86X00)	+= max86x00.o
+obj-$(CONFIG_FORCE_FAST_CHARGE) += fastchg.o
 
 obj-y += msm_secboot.o
